@@ -1,11 +1,74 @@
 # Changes
 
-## 2.1.0 (...)
+## 2.1.3 (2 May 2026)
+
+### Security
+
+Fix: harden webhook URL validation parsing and reject non-RFC characters.
+
+In some malformed URLs, Python’s standard URL parser (urllib) and the HTTP
+client stack (requests / urllib3) do not agree on which host is actually being
+targeted. That could allow a webhook URL to pass Bugsink’s outbound-host checks
+while the actual HTTP request is sent somewhere else. See:
+
+https://github.com/bugsink/bugsink/security/advisories/GHSA-fp53-qcf8-2xx2
+
+### Smaller fixes
+
+* Add issue-level markdown, see #334.
+* Fix installation quota counting across projects, see #359.
+* When vacuuming files, don't load them in memory, and allow long-running totals queries, see #363, #373 and #372.
+* Refuse to send email as something@bugsink.com for self-hosters, see 3ff3a6fbeb6d.
+* Fix `MultipleObjectsReturned` when user has unaccepted project memberships, see 653be6968f6e.
+* Cleanup lingering files for `MAX_EVENT_SIZE` overshoots, see #370.
+* Fix some `.get(context, {})` usages and an exception-path double-exception, see #369.
+* Upgrade `gunicorn` requirement from `==25.1.*` to `==25.3.*`, see 2d5e0071cf66.
+* Upgrade monofy, see #367.
+
+## 2.1.2 (11 April 2026)
+
+* Add stored file count and byte caps, see #355
+* Error message readability in dark mode, see #362
+
+## 2.1.1 (9 April 2026)
+
+### Security
+
+Fix: avoid using upload checksums as temporary filenames.
+
+The recent temp-file assembly change made checksum values part of path
+construction before they had been validated. An authenticated caller could
+thereby reach a write-before-checksum-mismatch path during file assembly.
+
+### Smaller fixes
+
+* AuthToken deletion is now idempotent, so mashing the delete button no longer results in a spurious 500.
+* Disable phonehome in development, see #357.
+* Allow enabling `USE_ADMIN` via environment variable, see #361.
+* Fix sourcemap application when `sourcesContent` contains `null`, see #360.
+
+## 2.1.0 (4 April 2026)
 
 * Show open issue counts on project list (skipping very large projects), see #228
 
-* Add outbound webhook destination destinations can be filtered by hostname/IP/CIDR allow/deny lists and non-global IPs
-  are blocked by default. See #339 and [the docs](https://www.bugsink.com/docs/webhook-outbound-policy/).
+* Add outbound webhook destination policy: destinations can be filtered by hostname/IP/CIDR allow/deny lists and
+  non-global IPs are blocked by default. See #339 and [the docs](https://www.bugsink.com/docs/webhook-outbound-policy/).
+
+* Add object storage for uploaded files via `OBJECT_STORAGES`, including `migrate_to_current_objectstorage` and
+  `cleanup_objectstorage`, see #354.
+
+* File uploads and artifact bundle assembly now enforce server-side limits more strictly: chunk uploads are checked
+  server-side, `MAX_FILE_SIZE` applies to assembled files too, and artifact bundles no longer need to be loaded fully
+  into memory during extraction, see #356.
+
+* Add a synchronous `vacuum` command as a single entry point for cleanup tasks, and add `MAX_EVENT_AGE_DAYS` /
+  `delete_old_events` for age-based event cleanup, see #350 and #48.
+
+* Docker config: add `USE_X_FORWARDED_HOST` and `USE_X_FORWARDED_FOR`, see #336 and d3e743d.
+
+* Sourcemaps: handle unmappable frames per-frame, so mixed mapped/unmapped stacktraces keep rendering, see #330.
+
+* Reject events at ingest when retention is configured as zero, see #341.
 
 ## 2.0.14 (3 March 2026)
 

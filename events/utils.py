@@ -140,19 +140,20 @@ def apply_sourcemaps(event_data):
         ]
 
     sourcemap_for_filename = {
-        filename: ecma426.loads(_postgres_fix(meta.file.data))
+        filename: ecma426.loads(_postgres_fix(meta.file.get_raw_data()))
         for (filename, meta) in filenames_with_metas
     }
 
     source_for_filename = {}
     for filename, meta in filenames_with_metas:
-        sm_data = json.loads(_postgres_fix(meta.file.data))
+        sm_data = json.loads(_postgres_fix(meta.file.get_raw_data()))
 
         sources = sm_data.get("sources", [])
         sources_content = sm_data.get("sourcesContent", [])
 
         for (source_file_name, source_file) in zip(sources, sources_content):
-            source_for_filename[source_file_name] = source_file.splitlines()
+            if source_file is not None:
+                source_for_filename[source_file_name] = source_file.splitlines()
 
     for exception in get_values(event_data.get("exception", {})):
         for frame in exception.get("stacktrace", {}).get("frames", []):

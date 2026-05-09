@@ -49,7 +49,7 @@ from sentry.minidump import merge_minidump_event
 from .parsers import StreamingEnvelopeParser, ParseError
 from .filestore import get_filename_for_event_id
 from .tasks import digest
-from .event_counter import check_for_thresholds
+from .event_counter import check_for_thresholds, count_for_thresholds, filter_for_periods, state_for_threshold
 from .models import StoreEnvelope, DontStoreEnvelope, Envelope
 
 
@@ -86,6 +86,26 @@ def update_issue_counts(per_issue):
 
     for count, issue_ids in by_count.items():
         Issue.objects.filter(id__in=issue_ids).update(stored_event_count=F("stored_event_count") - count)
+
+
+def check_for_thresholds_on_installation(qs, now, thresholds, add_for_current=0):
+    # project_digest_order is only monotonic per project, so installation-wide counting sums project-local results
+    # rather than trying to pretend there is a single installation-wide order.
+    project_ids = list(qs.order_by().values_list("project_id", flat=True).distinct())
+    total_events_in_periods = [add_for_current] * len(thresholds)
+
+    for project_id in project_ids:
+        project_counts = count_for_thresholds(qs.filter(project_id=project_id), now, thresholds)
+        for i, (project_total_events_in_period, _) in enumerate(project_counts):
+            total_events_in_periods[i] += project_total_events_in_period
+
+    states = []
+    for i, threshold in enumerate(thresholds):
+        period_name, nr_of_periods, _ = threshold
+        qs_for_period = filter_for_periods(qs, period_name, nr_of_periods, now)
+        states.append(state_for_threshold(qs_for_period, now, total_events_in_periods[i], threshold))
+
+    return states
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -172,6 +192,17 @@ class BaseIngestAPIView(View):
     def get_project_for_request(cls, project_pk, request):
         sentry_key = cls.get_sentry_key_for_request(request)
         return cls.get_project(project_pk, sentry_key)
+
+    @classmethod
+    def cleanup_ingestion_files(cls, ingestion_id):
+        for filetype in ["event", "minidump"]:
+            filename = get_filename_for_event_id(ingestion_id, filetype=filetype)
+            try:
+                os.unlink(filename)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning("Failed to clean up ingestion file %s", filename, exc_info=e)
 
     @classmethod
     def _minidump_post_data(cls, request):
@@ -364,9 +395,12 @@ class BaseIngestAPIView(View):
             issue = grouping.issue
             issue_created = False
 
-            # update the denormalized fields
+            # update the denormalized fields; calculated_type/value track the latest event so the issue title
+            # reflects the most recent exception (otherwise it stays frozen to the first event's message).
             issue.last_seen = ingested_at
             issue.digested_event_count += 1
+            issue.calculated_type = calculated_type
+            issue.calculated_value = calculated_value
 
         except Grouping.DoesNotExist:
             # we don't have Project.issue_count here ('premature optimization') so we just do an aggregate instead.
@@ -529,7 +563,7 @@ class BaseIngestAPIView(View):
         if ((digested_event_count >= installation.next_quota_check) or
                 (installation.next_quota_check - digested_event_count > min_threshold)):
 
-            states = check_for_thresholds(Event.objects.all(), now, thresholds, 1)
+            states = check_for_thresholds_on_installation(Event.objects.all(), now, thresholds, 1)
 
             until, threshold_info = max(
                 [(below_from, ti) for (is_exceeded, below_from, _, ti) in states if is_exceeded],
@@ -701,6 +735,9 @@ class IngestEnvelopeAPIView(BaseIngestAPIView):
 
         try:
             return self._post2(request, input_stream, ingested_at, ingestion_id, project_pk)
+        except Exception:
+            self.cleanup_ingestion_files(ingestion_id)
+            raise
         finally:
             # storing stuff in the DB on-ingest (rather than on digest-only) is not "as architected"; it's only
             # acceptible because this is a debug-only thing which is turned off by default; but even for me and other
@@ -827,6 +864,7 @@ class IngestEnvelopeAPIView(BaseIngestAPIView):
             logger.info(
                 "can only deal with one event/minidump per envelope but found %s/%s, ignoring this envelope.",
                 event_count, minidump_count)
+            self.cleanup_ingestion_files(ingestion_id)
             return HttpResponse()
 
         event_metadata = self.get_event_meta(envelope_headers["event_id"], ingested_at, ingestion_id, request, project)
