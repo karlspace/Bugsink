@@ -79,7 +79,7 @@ EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 
-SERVER_EMAIL = DEFAULT_FROM_EMAIL = 'Klaas van Schelven <klaas@bugsink.com>'
+SERVER_EMAIL = DEFAULT_FROM_EMAIL = 'Bugsink Development Server <bugsink@example.org>'
 
 
 BUGSINK = {
@@ -120,6 +120,8 @@ BUGSINK = {
 
     # in development we want optional features enabled to [1] play with them and [2] have the tests work
     "FEATURE_MINIDUMPS": True,
+    # Avoid polluting phonehome from local development and test runs.
+    "PHONEHOME": False,
 }
 
 
@@ -136,7 +138,6 @@ if not I_AM_RUNNING == "TEST":
             "OPTIONS": {
                 "basepath": safe_join(BASE_DIR, "filestorage"),
                 "compression_algorithm": "br",
-                "future_kwarg": "added here for testing",
             },
             "USE_FOR_WRITE": True,
         },

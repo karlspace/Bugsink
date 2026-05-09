@@ -8,6 +8,7 @@ from bugsink.settings.default import DATABASES
 
 _KIBIBYTE = 1024
 _MEBIBYTE = 1024 * _KIBIBYTE
+_GIBIBYTE = 1024 * _MEBIBYTE
 _PORT = os.environ.get("PORT", "8000")
 
 
@@ -153,6 +154,8 @@ BUGSINK = {
     # you can customize this as e.g. "My Bugsink" or "Bugsink for My Company"
     "SITE_TITLE": os.getenv("SITE_TITLE", "Bugsink"),
 
+    "USE_ADMIN": os.getenv("USE_ADMIN", False),
+
     # Settings for Users, Teams and Projects
     "SINGLE_USER": os.getenv("SINGLE_USER", "False").lower() in ("true", "1", "yes"),
 
@@ -172,6 +175,8 @@ BUGSINK = {
     "MAX_EVENT_COMPRESSED_SIZE": int(os.getenv("MAX_EVENT_COMPRESSED_SIZE", 200 * _KIBIBYTE)),
     "MAX_ENVELOPE_SIZE": int(os.getenv("MAX_ENVELOPE_SIZE", 100 * _MEBIBYTE)),
     "MAX_ENVELOPE_COMPRESSED_SIZE": int(os.getenv("MAX_ENVELOPE_COMPRESSED_SIZE", 20 * _MEBIBYTE)),
+    # For large MAX_FILE_SIZE values, you may want FILE_OBJECT_STORAGE_PATH configured too.
+    "MAX_FILE_SIZE": int(os.getenv("MAX_FILE_SIZE", 2 * _GIBIBYTE)),
 
     # Bugsink-specific limits:
     # The default values are 1_000, 5_000, 1M respectively; which corresponds to ~6%, ~2.7%, .8% of the total capacity
@@ -186,6 +191,9 @@ BUGSINK = {
 
     "MAX_RETENTION_PER_PROJECT_EVENT_COUNT": int_or_none(os.getenv("MAX_RETENTION_PER_PROJECT_EVENT_COUNT", None)),
     "MAX_RETENTION_EVENT_COUNT": int_or_none(os.getenv("MAX_RETENTION_EVENT_COUNT", None)),
+    "MAX_EVENT_AGE_DAYS": int_or_none(os.getenv("MAX_EVENT_AGE_DAYS", None)),
+    "MAX_STORED_FILE_COUNT": int_or_none(os.getenv("MAX_STORED_FILE_COUNT", None)),
+    "MAX_STORED_FILE_BYTES": int_or_none(os.getenv("MAX_STORED_FILE_BYTES", None)),
 
     # Settings that help with debugging and development ("why isn't Bugsink doing what I expect?")
     "VALIDATE_ON_DIGEST": os.getenv("VALIDATE_ON_DIGEST", "none").lower(),  # other legal values are "warn" and "strict"
@@ -229,6 +237,19 @@ if os.getenv("FILE_EVENT_STORAGE_PATH"):
                 "basepath": os.getenv("FILE_EVENT_STORAGE_PATH"),
             },
             "USE_FOR_WRITE": os.getenv("FILE_EVENT_STORAGE_USE_FOR_WRITE", "false").lower() in ("true", "1", "yes"),
+        },
+    }
+
+if os.getenv("FILE_OBJECT_STORAGE_PATH"):
+    BUGSINK["OBJECT_STORAGES"] = {
+        "file": {
+            "file_object_storage": {
+                "STORAGE": "files.storage.ObjectFileStorage",
+                "OPTIONS": {
+                    "basepath": os.getenv("FILE_OBJECT_STORAGE_PATH"),
+                },
+                "USE_FOR_WRITE": os.getenv("FILE_OBJECT_STORAGE_USE_FOR_WRITE", "false").lower() in ("true", "1", "yes"),
+            },
         },
     }
 
