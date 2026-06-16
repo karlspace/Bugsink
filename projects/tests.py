@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 from bugsink.test_utils import TransactionTestCase25251 as TransactionTestCase
 from bugsink.utils import get_model_topography
-from projects.models import Project, ProjectMembership, ProjectRole
+from projects.forms import ProjectForm
+from projects.models import Project, ProjectMembership, ProjectRole, ProjectVisibility
 from events.factories import create_event
 from issues.factories import get_or_create_issue, denormalized_issue_fields
 from tags.models import store_tags
@@ -13,6 +14,7 @@ from issues.models import TurningPoint, TurningPointKind, Issue
 from alerts.models import MessagingServiceConfig
 from releases.models import Release
 from files.models import File, FileMetadata
+from events.usage import record_event_counts
 
 from .tasks import get_model_topography_with_project_override
 
@@ -44,6 +46,7 @@ class ProjectDeletionTestCase(TransactionTestCase):
         self.event.save()
 
         store_tags(self.event, self.issue, {"foo": "bar"})
+        record_event_counts(self.project, self.issue, self.event.digested_at)
 
     def test_delete_project(self):
         models = [apps.get_model(app_label=s.split('.')[0], model_name=s.split('.')[1].lower()) for s in [
@@ -52,6 +55,8 @@ class ProjectDeletionTestCase(TransactionTestCase):
                   "tags.TagValue",
                   "tags.TagKey",
                   "issues.TurningPoint",
+                  "events.IssueEventCountsPerHour",
+                  "events.ProjectEventCountsPerHour",
                   "events.Event",
                   "issues.Grouping",
                   "files.FileMetadata",
@@ -72,7 +77,7 @@ class ProjectDeletionTestCase(TransactionTestCase):
         # correct for bugsink/transaction.py's select_for_update for non-sqlite databases
         correct_for_select_for_update = 1 if 'sqlite' not in settings.DATABASES['default']['ENGINE'] else 0
 
-        with self.assertNumQueries(29 + correct_for_select_for_update):
+        with self.assertNumQueries(33 + correct_for_select_for_update):
             self.project.delete_deferred()
 
         # tests run w/ TASK_ALWAYS_EAGER, so in the below we can just check the database directly
@@ -106,6 +111,7 @@ class ProjectDeletionTestCase(TransactionTestCase):
             (apps.get_model('events', 'Event'), 'issue'),
             (apps.get_model('issues', 'TurningPoint'), 'triggering_event'),
             (apps.get_model('tags', 'EventTag'), 'event'),
+            (apps.get_model('events', 'IssueEventCountsPerHour'), 'issue'),
             (apps.get_model('tags', 'EventTag'), 'issue'),
             (apps.get_model('tags', 'IssueTag'), 'issue'),
             (apps.get_model('issues', 'Grouping'), 'project'),
@@ -117,6 +123,8 @@ class ProjectDeletionTestCase(TransactionTestCase):
             (apps.get_model('events', 'Event'), 'project'),
             (apps.get_model('issues', 'TurningPoint'), 'triggering_event'),
             (apps.get_model('tags', 'EventTag'), 'event'),
+            (apps.get_model('events', 'ProjectEventCountsPerHour'), 'project'),
+            (apps.get_model('events', 'IssueEventCountsPerHour'), 'project'),
             (apps.get_model('tags', 'TagKey'), 'project'),
             (apps.get_model('tags', 'TagValue'), 'key'),
             (apps.get_model('tags', 'EventTag'), 'value'),
@@ -136,6 +144,8 @@ class ProjectDeletionTestCase(TransactionTestCase):
             (apps.get_model('tags', 'TagValue'), 'project'),
             (apps.get_model('tags', 'TagKey'), 'project'),
             (apps.get_model('issues', 'TurningPoint'), 'project'),
+            (apps.get_model('events', 'IssueEventCountsPerHour'), 'project'),
+            (apps.get_model('events', 'ProjectEventCountsPerHour'), 'project'),
             (apps.get_model('events', 'Event'), 'project'),
             (apps.get_model('issues', 'Grouping'), 'project'),
             (apps.get_model('alerts', 'MessagingServiceConfig'), 'project'),
@@ -144,6 +154,29 @@ class ProjectDeletionTestCase(TransactionTestCase):
             (apps.get_model('issues', 'Issue'), 'project'),
             (apps.get_model('files', 'FileMetadata'), 'project'),
         ])
+
+
+class ProjectFormTestCase(TransactionTestCase):
+
+    def test_slug_is_read_only_on_edit(self):
+        # Slug is exposed on the edit form for visibility but must not be editable: it's part of the issue's short
+        # identifier, so changing it would break external references.
+        project = Project.objects.create(name="Original Name", slug="original-slug")
+
+        form = ProjectForm(
+            data={
+                "name": "Renamed",
+                "slug": "tampered-slug",
+                "visibility": ProjectVisibility.JOINABLE,
+                "retention_max_event_count": 10000,
+            },
+            instance=project,
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        saved = form.save()
+        self.assertEqual(saved.slug, "original-slug")
+        self.assertEqual(saved.name, "Renamed")
 
 
 class ProjectListOpenIssueCountTestCase(TransactionTestCase):
