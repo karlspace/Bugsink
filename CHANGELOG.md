@@ -1,10 +1,30 @@
 # Changes
 
-## Unreleased
+## 2.3.1 (30 June 2026)
 
-* Add native support for CSP violation reports via a new `/api/<project_pk>/security/` endpoint, compatible with the
-  `report-uri` directive browsers emit. Reports are translated into events and pushed through the existing envelope
-  pipeline, grouped by `(effective-directive, blocked-uri)`.
+* Decode percent-encoded components from `DATABASE_URL` after parsing (See #423)
+* Return 404 for malformed API lookups (in markdown view)
+
+## 2.3.0 (23 June 2026)
+
+### CSP reports
+
+Add native support for CSP violation reports via a new `/api/<project_pk>/security/` endpoint, compatible with the
+`report-uri` directive browsers emit. Reports are translated into events and pushed through the existing envelope
+pipeline, grouped by `(effective-directive, blocked-uri)`, see #371.
+
+### Sparklines
+
+Issue event pages now show a 28-day event-volume sparkline. The sparkline is backed by hourly event-count buckets, so
+regular page views do not need to rescan the event table. Bars can be clicked to jump to an event in that time bucket,
+see #417 and #420.
+
+### Smaller fixes
+
+* Show full exception values on stacktrace pages, see #412.
+* Include Bugsink's Sentry-compatible API surface in the OpenAPI schema, see #413.
+* Return `{"id": ...}` from the `/envelope/` endpoint, see #396.
+* Update the Docker run command in the README, see #415.
 
 ## 2.2.2 (4 June 2026)
 
