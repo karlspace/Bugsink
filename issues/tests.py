@@ -9,7 +9,7 @@ from io import BytesIO, StringIO
 from glob import glob
 from unittest import TestCase as RegularTestCase
 from unittest.mock import patch
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from django.test import TestCase as DjangoTestCase
@@ -35,10 +35,10 @@ from events.markdown_stacktrace import render_stacktrace_md
 from files.models import File, FileMetadata
 from events.usage import record_event_counts
 
-from .models import Issue, IssueStateManager, TurningPoint, TurningPointKind
+from .models import (
+    Issue, IssueStateManager, TurningPoint, TurningPointKind)
 from .regressions import is_regression, is_regression_2, issue_is_regression
 from .factories import denormalized_issue_fields
-from .utils import get_issue_grouper_for_data
 from .tasks import get_model_topography_with_issue_override
 
 User = get_user_model()
@@ -114,10 +114,10 @@ class RegressionUtilTestCase(RegularTestCase):
             events_at=["a"],
             current_event_at="b"))
 
-    def test_observations_override_marked_resolutions(self):
-        # if an issue has been marked as resolved but has also (presumably later on) been seen in reality to not have
-        # been resolved, it is not resolved by that release. Hence, re-occurrence is not a (new) regression.
-        self.assertFalse(is_regression(
+    def test_marked_resolutions_override_observations(self):
+        # Marking an issue as resolved in a release where it has already been seen means "resolved as of now".
+        # A later event in that same release is therefore a regression.
+        self.assertTrue(is_regression(
             self.releases,
             fixed_at=["c"],
             events_at=["c"],
@@ -264,6 +264,53 @@ class RegressionIssueTestCase(DjangoTestCase):
         self.assertFalse(issue_is_regression(fresh(issue), "1.0.0"))
         self.assertFalse(issue_is_regression(fresh(issue), "2.0.0"))
 
+    def test_issue_is_regression_with_releases_resolve_by_latest_after_observation(self):
+        project = Project.objects.create()
+        timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        create_release_if_needed(fresh(project), "1.0.0", timestamp)
+        create_release_if_needed(fresh(project), "2.0.0", timestamp)
+
+        issue = Issue.objects.create(
+            project=project,
+            events_at="2.0.0\n",
+            **denormalized_issue_fields(),
+        )
+
+        IssueStateManager.resolve_by_latest(issue)
+        issue.save()
+
+        self.assertFalse(issue_is_regression(fresh(issue), "1.0.0"))
+        self.assertTrue(issue_is_regression(fresh(issue), "2.0.0"))
+
+    def test_issue_is_regression_after_plain_resolve_on_release_project(self):
+        project = Project.objects.create()
+        timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        create_release_if_needed(fresh(project), "1.0.0", timestamp)
+        create_release_if_needed(fresh(project), "1.1.0", timestamp)
+
+        issue = Issue.objects.create(
+            project=project,
+            events_at="1.0.0\n",
+            **denormalized_issue_fields(),
+        )
+
+        # Seen at 1.0, resolved at 1.0.
+        IssueStateManager.resolve_by_release(issue, "1.0.0")
+        issue.save()
+
+        # Seen at 1.1, then resolved without pinning to a release.
+        IssueStateManager.reopen(issue)
+        issue.events_at += "1.1.0\n"
+        IssueStateManager.resolve(issue)
+        issue.save()
+
+        self.assertEqual(fresh(issue).fixed_at, "1.0.0\n")
+        self.assertTrue(fresh(issue).is_resolved_unconditionally)
+        self.assertTrue(issue_is_regression(fresh(issue), "1.0.0"))
+        self.assertTrue(issue_is_regression(fresh(issue), "1.1.0"))
+
     def test_issue_is_regression_with_releases_resolve_by_next(self):
         project = Project.objects.create()
         timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -289,39 +336,13 @@ class RegressionIssueTestCase(DjangoTestCase):
         create_release_if_needed(fresh(project), "4.0.0", timestamp)
         self.assertTrue(issue_is_regression(fresh(issue), "4.0.0"))
 
-
-"""
-Some thoughts on re-opening, that I have to put 'somewhere'; might as well put them here in the tests where I first
-thought of them... The direct cause for these thoughts was that I found it very hard to reason about the following
-question: "what does re-opening an issue mean for the `fixed_at` points?"
-
-First: re-opening an issue (from the UI) is kinda funny in the first place. What are you saying by doing that anyway?
-You're saying "this is an issue that continues to exist, despite me/someone at some point saying that it was resolved".
-You're doing this with "pure brainpower", i.e. by thinking it through rather than waiting for an issue to reoccur
-naturally.
-
-Why would you ever want to do this? My main guess is: to undo a click on resolve that you just did. If that's so, we
-might implement re-open more closely as such an undo (and the anwer to the first question would also follow from it,
-i.e. it would be "the last-added `fixed_at` point should be removed"
-
-The main consequences of re-opening are: you won't be bothered (alerts) about a regression that you just understood to
-still exist. And: if you go looking for unresolved issues, you'll find this one.
-
-Having said all of that, I might do something radical and _not implement reopen in the UI at all!_ Let's see if I run
-into the lack of it existing.
-
-... having said that, it's not _that bad_, and I think I could answer the original question, if pressed (allowing us to
-reintroduce the Reopen button in the UI). I would simply say: let's not bother doing a proper administration of
-`fixed_at` points when the issue is manually reopened. Manually reopening as such allows us to avoid an alert that we
-don't need, and get our administration of not-yet-resolved issues in order. The only scenario where this goes wrong is
-something along these lines:
-
-at some point ("a") which does not have seen breakage we mark as resolved. we then reopen. "a" remains marked as
-resolved, because we're in the "let's not bother" scenario. Then, we get a later point where we first see the issue in
-the wild ("b") and resolve it ("c"). Then, if we were to see it again in "a", as per the test_longer_patterns, this
-would be seen as a regression when in reality it was never solved in "a", and its marking-as-such should probably have
-seen as an undo rather than anything else.
-"""
+        # reopen cancels the "fixed in some future release" claim
+        IssueStateManager.reopen(issue)
+        issue.save()
+        issue = fresh(issue)
+        self.assertFalse(issue.is_resolved)
+        self.assertFalse(issue.is_resolved_by_next_release)
+        self.assertFalse(issue_is_regression(issue, "4.0.0"))
 
 
 class MuteUnmuteTestCase(TransactionTestCase):
@@ -412,7 +433,7 @@ class ViewTests(TransactionTestCase):
         super().setUp()
         self.user = User.objects.create_user(username='test', password='test')
         self.project = Project.objects.create(name="test")
-        ProjectMembership.objects.create(project=self.project, user=self.user)
+        ProjectMembership.objects.create(project=self.project, user=self.user, accepted=True)
         self.issue, _ = get_or_create_issue(self.project)
         self.event = create_event(self.project, self.issue, project_digest_order=1)
         self.client.force_login(self.user)
@@ -421,12 +442,72 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/{self.project.id}/")
         self.assertContains(response, self.issue.title())
 
+    def test_pending_project_membership_cannot_view_issue_list(self):
+        pending_user = User.objects.create_user(username='pending', password='test')
+        ProjectMembership.objects.create(project=self.project, user=pending_user, accepted=False)
+        self.client.force_login(pending_user)
+
+        response = self.client.get(f"/issues/{self.project.id}/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_issue_list_view_shows_24h_sparkline(self):
+        now = datetime.now(timezone.utc)
+        record_event_counts(self.project, self.issue, now, self.event.digest_order)
+        record_event_counts(
+            self.project, self.issue, datetime.now(timezone.utc) - timedelta(days=2), self.event.digest_order)
+
+        response = self.client.get(f"/issues/{self.project.id}/")
+
+        self.assertContains(response, "1 event in the past 24h")
+
     def test_issue_list_bulk_action_ignores_issues_from_other_projects(self):
         other_project = Project.objects.create(name="other")
         other_issue, _ = get_or_create_issue(other_project)
 
         response = self.client.post(
             f"/issues/{self.project.id}/",
+            {"issue_ids[]": [str(other_issue.id)], "action": "resolve"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        other_issue.refresh_from_db()
+        self.assertFalse(other_issue.is_resolved)
+
+    def test_global_issue_list_only_shows_issues_from_projects_the_user_can_access(self):
+        self.issue.calculated_type = "AccessibleError"
+        self.issue.calculated_value = "visible"
+        self.issue.save(update_fields=["calculated_type", "calculated_value"])
+        other_project = Project.objects.create(name="other")
+        other_issue, _ = get_or_create_issue(other_project)
+        other_issue.calculated_type = "InaccessibleError"
+        other_issue.calculated_value = "hidden"
+        other_issue.save(update_fields=["calculated_type", "calculated_value"])
+
+        response = self.client.get("/issues/")
+
+        self.assertContains(response, "AccessibleError")
+        self.assertContains(response, self.issue.friendly_id())
+        self.assertNotContains(response, "InaccessibleError")
+
+    def test_global_issue_list_ignores_pending_project_memberships(self):
+        pending_project = Project.objects.create(name="pending")
+        ProjectMembership.objects.create(project=pending_project, user=self.user, accepted=False)
+        pending_issue, _ = get_or_create_issue(pending_project)
+        pending_issue.calculated_type = "PendingError"
+        pending_issue.calculated_value = "hidden"
+        pending_issue.save(update_fields=["calculated_type", "calculated_value"])
+
+        response = self.client.get("/issues/")
+
+        self.assertNotContains(response, "PendingError")
+
+    def test_global_issue_list_bulk_action_ignores_issues_from_inaccessible_projects(self):
+        other_project = Project.objects.create(name="other")
+        other_issue, _ = get_or_create_issue(other_project)
+
+        response = self.client.post(
+            "/issues/",
             {"issue_ids[]": [str(other_issue.id)], "action": "resolve"},
         )
 
@@ -476,6 +557,21 @@ class ViewTests(TransactionTestCase):
     def test_issue_tags(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/tags/")
         self.assertContains(response, self.issue.title())
+
+    def test_issue_sidebar_summarizes_long_release_lists(self):
+        self.issue.events_at = "\n".join(f"2026.1.{i}.0" for i in range(10)) + "\n"
+        self.issue.save()
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
+
+        self.assertContains(response, "... «4 more» ...,")
+        self.assertContains(response, "2026.1.0.0")
+        self.assertContains(response, "2026.1.1.0")
+        self.assertContains(response, "2026.1.2.0")
+        self.assertContains(response, "2026.1.7.0")
+        self.assertContains(response, "2026.1.8.0")
+        self.assertContains(response, "2026.1.9.0")
+        self.assertNotContains(response, "2026.1.4.0")
 
     def test_issue_grouping(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/grouping/")
@@ -682,7 +778,7 @@ class ViewTests(TransactionTestCase):
         debug_id = uuid.uuid4()
         auth_token = AuthToken.objects.create()
         other_project = Project.objects.create(name="other")
-        ProjectMembership.objects.create(project=other_project, user=self.user)
+        ProjectMembership.objects.create(project=other_project, user=self.user, accepted=True)
         other_issue, _ = get_or_create_issue(other_project)
         sourcemap = json.dumps({
             "version": 3,
@@ -788,7 +884,7 @@ class IntegrationTest(TransactionTestCase):
     def test_many_issues_ingest_and_show(self):
         user = User.objects.create_user(username='test', password='test')
         project = Project.objects.create(name="test")
-        ProjectMembership.objects.create(project=project, user=user)
+        ProjectMembership.objects.create(project=project, user=user, accepted=True)
         self.client.force_login(user)
 
         sentry_auth_header = get_header_value(f"http://{ project.sentry_key }@hostisignored/{ project.id }")
@@ -883,7 +979,7 @@ class IntegrationTest(TransactionTestCase):
     def test_render_stacktrace_md(self):
         user = User.objects.create_user(username='test', password='test')
         project = Project.objects.create(name="test")
-        ProjectMembership.objects.create(project=project, user=user)
+        ProjectMembership.objects.create(project=project, user=user, accepted=True)
         self.client.force_login(user)
 
         sentry_auth_header = get_header_value(f"http://{ project.sentry_key }@hostisignored/{ project.id }")
@@ -962,127 +1058,6 @@ _no source context available_
 
 ### django/core/management/__init__.py in `missing_everything` [in-app]
 _no source context available_''', md)
-
-
-class GroupingUtilsTestCase(DjangoTestCase):
-
-    def test_empty_data(self):
-        self.assertEqual("Log Message: <no log message> ⋄ <no transaction>", get_issue_grouper_for_data({}))
-
-    def test_logentry_message_takes_precedence(self):
-        self.assertEqual("Log Message: msg: ? ⋄ <no transaction>", get_issue_grouper_for_data({"logentry": {
-            "message": "msg: ?",
-            "formatted": "msg: foobar",
-        }}))
-
-    def test_logentry_with_formatted_only(self):
-        self.assertEqual("Log Message: msg: foobar ⋄ <no transaction>", get_issue_grouper_for_data({"logentry": {
-            "formatted": "msg: foobar",
-        }}))
-
-    def test_logentry_with_transaction(self):
-        self.assertEqual("Log Message: msg ⋄ transaction", get_issue_grouper_for_data({
-            "logentry": {
-                "message": "msg",
-            },
-            "transaction": "transaction",
-        }))
-
-    def test_exception_empty_trace(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [],
-        }}))
-
-    def test_exception_trace_no_data(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{}],
-        }}))
-
-    def test_exception_value_only(self):
-        self.assertEqual("Error: exception message ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"value": "exception message"}],
-        }}))
-
-    def test_exception_type_only(self):
-        self.assertEqual("KeyError ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"type": "KeyError"}],
-        }}))
-
-    def test_exception_type_value(self):
-        self.assertEqual("KeyError: exception message ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"type": "KeyError", "value": "exception message"}],
-        }}))
-
-    def test_exception_multiple_frames(self):
-        self.assertEqual("KeyError: exception message ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{}, {}, {}, {"type": "KeyError", "value": "exception message"}],
-        }}))
-
-    def test_exception_transaction(self):
-        self.assertEqual("KeyError ⋄ transaction", get_issue_grouper_for_data({
-            "transaction": "transaction",
-            "exception": {
-                "values": [{"type": "KeyError"}],
-            }
-        }))
-
-    def test_exception_function_is_ignored_unless_specifically_synthetic(self):
-        # I make no value-judgement here on whether this is something we want to replicate in the future; as it stands
-        # this test just documents the somewhat surprising behavior that we inherited from GlitchTip/Sentry.
-        self.assertEqual("Error ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "stacktrace": {
-                        "frames": [{"function": "foo"}],
-                    },
-                }],
-            },
-        }))
-
-    def test_synthetic_exception_only(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "mechanism": {"synthetic": True},
-                }],
-            },
-        }))
-
-    def test_synthetic_exception_ignores_value(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "mechanism": {"synthetic": True},
-                    "value": "the ignored value",
-                }],
-            },
-        }))
-
-    def test_exception_uses_function_when_top_level_exception_is_synthetic(self):
-        self.assertEqual("foo ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "mechanism": {"synthetic": True},
-                    "stacktrace": {
-                        "frames": [{"function": "foo"}],
-                    },
-                }],
-            },
-        }))
-
-    def test_exception_with_non_string_value(self):
-        # In the GlitchTip code there is a mention of value sometimes containing a non-string value. Whether this
-        # happens in practice is unknown to me, but let's build something that can handle it.
-        self.assertEqual("KeyError: 123 ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"type": "KeyError", "value": 123}],
-        }}))
-
-    def test_simple_fingerprint(self):
-        self.assertEqual("fixed string", get_issue_grouper_for_data({"fingerprint": ["fixed string"]}))
-
-    def test_fingerprint_with_default(self):
-        self.assertEqual("Log Message: <no log message> ⋄ <no transaction> ⋄ fixed string",
-                         get_issue_grouper_for_data({"fingerprint": ["{{ default }}", "fixed string"]}))
 
 
 class IssueDeletionTestCase(TransactionTestCase):
