@@ -60,7 +60,7 @@ class ProjectInviteLinkTestCase(TransactionTestCase):
             "No invitation was sent because email is not set up. "
             "Hand out the following link to new-project-member@example.com yourself:",
         )
-        self.assertContains(response, "Project Members")
+        self.assertContains(response, f"Members · {self.project.name}")
         self.assertContains(response, reverse("project_members_accept_new_user", kwargs={
             "project_pk": self.project.pk,
             "token": verification.token,
@@ -95,11 +95,10 @@ class ProjectInviteLinkTestCase(TransactionTestCase):
         self.assertTrue(ProjectMembership.objects.filter(project=self.project, user=user, accepted=False).exists())
 
     @override_settings(EMAIL_BACKEND="django.core.mail.backends.dummy.EmailBackend")
-    def test_members_page_replaces_reinvite_with_copy_invite_link(self):
+    def test_members_page_shows_invite_link_for_active_user_when_email_backend_does_not_deliver(self):
         user = User.objects.create_user(
             username="pending-project-member@example.com",
             email="pending-project-member@example.com",
-            is_active=False,
         )
         ProjectMembership.objects.create(project=self.project, user=user, accepted=False)
 
@@ -111,14 +110,65 @@ class ProjectInviteLinkTestCase(TransactionTestCase):
         response = self.client.post(reverse("project_members", kwargs={"project_pk": self.project.pk}), {
             "action": f"copy_invite_link:{user.id}",
         })
-        verification = EmailVerification.objects.get(user=user)
 
         self.assertContains(response, "Hand out the following link to pending-project-member@example.com yourself:")
         self.assertNotContains(response, "Invitation not sent")
-        self.assertContains(response, reverse("project_members_accept_new_user", kwargs={
-            "project_pk": self.project.pk,
-            "token": verification.token,
-        }))
+        self.assertContains(response, reverse("project_members_accept", kwargs={"project_pk": self.project.pk}))
+        self.assertFalse(EmailVerification.objects.filter(user=user).exists())
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.dummy.EmailBackend")
+    def test_members_page_shows_disabled_reinvite_for_inactive_user_when_email_backend_does_not_deliver(self):
+        user = User.objects.create_user(
+            username="inactive-project-member@example.com",
+            email="inactive-project-member@example.com",
+            is_active=False,
+        )
+        ProjectMembership.objects.create(project=self.project, user=user, accepted=False)
+
+        response = self.client.get(reverse("project_members", kwargs={"project_pk": self.project.pk}))
+
+        self.assertNotContains(response, "Show invite link")
+        self.assertContains(response, "Reinvite")
+        self.assertContains(response, "disabled")
+        self.assertContains(response, "cursor-not-allowed")
+        self.assertFalse(EmailVerification.objects.filter(user=user).exists())
+
+        response = self.client.post(reverse("project_members", kwargs={"project_pk": self.project.pk}), {
+            "action": f"copy_invite_link:{user.id}",
+        })
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(EmailVerification.objects.filter(user=user).exists())
+
+        response = self.client.post(reverse("project_members", kwargs={"project_pk": self.project.pk}), {
+            "action": f"reinvite:{user.id}",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(EmailVerification.objects.filter(user=user).exists())
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.dummy.EmailBackend")
+    def test_invite_existing_inactive_user_does_not_create_invite_link(self):
+        user = User.objects.create_user(
+            username="existing-inactive-project-member@example.com",
+            email="existing-inactive-project-member@example.com",
+            is_active=False,
+        )
+
+        response = self.client.post(reverse("project_members_invite", kwargs={"project_pk": self.project.pk}), {
+            "email": "existing-inactive-project-member@example.com",
+            "role": ProjectRole.MEMBER,
+            "action": "invite",
+        }, follow=True)
+
+        self.assertContains(
+            response,
+            "Invitation created for existing-inactive-project-member@example.com, "
+            "but no email was sent because email is not set up.",
+        )
+        self.assertNotContains(response, "Invitation sent")
+        self.assertFalse(EmailVerification.objects.filter(user=user).exists())
+        self.assertTrue(ProjectMembership.objects.filter(project=self.project, user=user, accepted=False).exists())
 
 
 class ProjectDeletionTestCase(TransactionTestCase):
@@ -278,6 +328,46 @@ class ProjectFormTestCase(TransactionTestCase):
         saved = form.save()
         self.assertEqual(saved.slug, "original-slug")
         self.assertEqual(saved.name, "Renamed")
+
+    def test_same_project_name_is_allowed_in_another_team(self):
+        team_a = Team.objects.create(name="Team A")
+        team_b = Team.objects.create(name="Team B")
+        Project.objects.create(name="Backend", team=team_a)
+
+        form = ProjectForm(
+            data={
+                "team": team_b.id,
+                "name": "Backend",
+                "visibility": ProjectVisibility.JOINABLE,
+                "retention_max_event_count": 10000,
+                "grouping_mechanism": BUGSINK_GROUPING_V2,
+            },
+            team_qs=Team.objects.all(),
+        )
+
+        self.assertTrue(form.is_valid(), form.errors)
+        saved = form.save()
+        self.assertEqual("backend-0", saved.slug)  # slug stays globally unique; it identifies the project in the API
+
+    def test_duplicate_project_name_in_same_team_is_reported_on_the_name_field(self):
+        # On the name field specifically: our templates render per-field errors only, so a non-field error would be
+        # invisible and the form would appear to do nothing.
+        team = Team.objects.create(name="Team A")
+        Project.objects.create(name="Backend", team=team)
+
+        form = ProjectForm(
+            data={
+                "team": team.id,
+                "name": "Backend",
+                "visibility": ProjectVisibility.JOINABLE,
+                "retention_max_event_count": 10000,
+                "grouping_mechanism": BUGSINK_GROUPING_V2,
+            },
+            team_qs=Team.objects.all(),
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertEqual(["name"], list(form.errors))
 
     def test_changing_grouping_mechanism_starts_transition_window(self):
         project = Project.objects.create(

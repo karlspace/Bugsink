@@ -442,6 +442,26 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/{self.project.id}/")
         self.assertContains(response, self.issue.title())
 
+    def test_issue_list_sorting(self):
+        other_issue, _ = get_or_create_issue(
+            self.project, create_event_data(exception_type="FrequentError"))
+        now = datetime.now(timezone.utc)
+        Issue.objects.filter(id=self.issue.id).update(last_seen=now, digested_event_count=1)
+        Issue.objects.filter(id=other_issue.id).update(
+            last_seen=now - timedelta(days=1), digested_event_count=10)
+
+        response = self.client.get(f"/issues/{self.project.id}/", {"sort": "events"})
+        self.assertEqual([other_issue.id, self.issue.id], [issue.id for issue in response.context["page_obj"]])
+        self.assertContains(response, '<option value="events" selected>')
+        self.assertContains(response, f'href="/issues/{self.project.id}/muted/?sort=events"')
+
+        response = self.client.get(f"/issues/{self.project.id}/", {"sort": "last_seen"})
+        self.assertEqual([self.issue.id, other_issue.id], [issue.id for issue in response.context["page_obj"]])
+
+        response = self.client.get(f"/issues/{self.project.id}/", {"sort": "invalid"})
+        self.assertEqual("last_seen", response.context["sort"])
+        self.assertEqual([self.issue.id, other_issue.id], [issue.id for issue in response.context["page_obj"]])
+
     def test_pending_project_membership_cannot_view_issue_list(self):
         pending_user = User.objects.create_user(username='pending', password='test')
         ProjectMembership.objects.create(project=self.project, user=pending_user, accepted=False)
@@ -490,6 +510,19 @@ class ViewTests(TransactionTestCase):
         self.assertContains(response, self.issue.friendly_id())
         self.assertNotContains(response, "InaccessibleError")
 
+    def test_global_issue_list_sorts_by_event_count_across_projects(self):
+        other_project = Project.objects.create(name="other")
+        ProjectMembership.objects.create(project=other_project, user=self.user, accepted=True)
+        other_issue, _ = get_or_create_issue(other_project)
+        self.issue.digested_event_count = 1
+        self.issue.save(update_fields=["digested_event_count"])
+        other_issue.digested_event_count = 10
+        other_issue.save(update_fields=["digested_event_count"])
+
+        response = self.client.get("/issues/", {"sort": "events"})
+
+        self.assertEqual([other_issue.id, self.issue.id], [issue.id for issue in response.context["page_obj"]])
+
     def test_global_issue_list_ignores_pending_project_memberships(self):
         pending_project = Project.objects.create(name="pending")
         ProjectMembership.objects.create(project=pending_project, user=self.user, accepted=False)
@@ -514,6 +547,32 @@ class ViewTests(TransactionTestCase):
         self.assertEqual(response.status_code, 200)
         other_issue.refresh_from_db()
         self.assertFalse(other_issue.is_resolved)
+
+    def test_global_issue_list_deletes_issues_from_multiple_projects(self):
+        self.project.issue_count = 1
+        self.project.stored_event_count = 1
+        self.project.save(update_fields=["issue_count", "stored_event_count"])
+        self.issue.stored_event_count = 1
+        self.issue.save(update_fields=["stored_event_count"])
+
+        other_project = Project.objects.create(name="other", issue_count=1)
+        ProjectMembership.objects.create(project=other_project, user=self.user, accepted=True)
+        other_issue, _ = get_or_create_issue(other_project)
+
+        response = self.client.post(
+            "/issues/",
+            {
+                "issue_ids[]": [str(self.issue.id), str(other_issue.id)],
+                "action": "delete",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Issue.objects.filter(id__in=[self.issue.id, other_issue.id]).exists())
+        self.project.refresh_from_db()
+        other_project.refresh_from_db()
+        self.assertEqual(0, self.project.issue_count)
+        self.assertEqual(0, other_project.issue_count)
 
     def test_issue_stacktrace(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
@@ -653,8 +712,11 @@ class ViewTests(TransactionTestCase):
 
         class FakeMapping:
             source = "good-source.ts"
-            original_line = 10
             name = "mappedFunction"
+
+            def __init__(self, original_line, original_column):
+                self.original_line = original_line
+                self.original_column = original_column
 
         class BrokenSourceMap:
             def lookup_left(self, *_args, **_kwargs):
@@ -662,8 +724,12 @@ class ViewTests(TransactionTestCase):
 
         class GoodSourceMap:
             def lookup_left(self, line, column):
-                if (line, column) == (5, 12):
-                    return FakeMapping()
+                if (line, column) == (5, 11):
+                    return FakeMapping(10, 0)
+                if (line, column) == (6, 0):
+                    return FakeMapping(9, 4)
+                if (line, column) == (7, 0):
+                    return FakeMapping(8, 2)
 
         def fake_loads(data):
             sm = json.loads(data)
@@ -675,6 +741,7 @@ class ViewTests(TransactionTestCase):
 
         mock_ecma426_loads.side_effect = fake_loads
 
+        # This four-case missing/zero × raw/mapped matrix is defensive; we haven't seen problems in the wild yet.
         event_data = {
             "event_id": uuid.uuid4().hex,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -688,6 +755,10 @@ class ViewTests(TransactionTestCase):
                             {"filename": "missing.js", "lineno": 3, "colno": 9, "in_app": True},
                             {"filename": "broken.js", "lineno": 11, "colno": 36758, "in_app": True},
                             {"filename": "good.js", "lineno": 6, "colno": 12, "in_app": True},
+                            {"filename": "good.js", "lineno": 7, "colno": 0, "in_app": True},
+                            {"filename": "good.js", "lineno": 8, "in_app": True},
+                            {"filename": "zero-column.js", "lineno": 5, "colno": 0, "in_app": True},
+                            {"filename": "no-column.js", "lineno": 4, "in_app": True},
                         ]
                     },
                 }]
@@ -705,10 +776,15 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.id}/")
         self.assertEqual(200, response.status_code)
         self.assertContains(response, f"No sourcemaps found for Debug ID {missing_debug_id}")
-        self.assertContains(response, f"Error mapping (10, 36758) into sourcemap ({broken_debug_id})")
-        self.assertContains(response, "broken.js")
+        self.assertContains(response, f"Error mapping (10, 36757) into sourcemap ({broken_debug_id})")
+        self.assertContains(response, "missing.js</span> line <span class=\"font-bold\">3:9</span>.")
+        self.assertContains(response, "broken.js</span> line <span class=\"font-bold\">11:36758</span>.")
         self.assertContains(response, "good-source.ts")
-        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11</span>")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11:1</span>.")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">10:5</span>.")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">9:3</span>.")
+        self.assertContains(response, "zero-column.js</span> line <span class=\"font-bold\">5</span>.")
+        self.assertContains(response, "no-column.js</span> line <span class=\"font-bold\">4</span>.")
 
     @patch("events.utils.ecma426.loads")
     def test_use_sourcemap_in_stacktrace_with_null_sources_content(self, mock_ecma426_loads):
@@ -736,11 +812,12 @@ class ViewTests(TransactionTestCase):
         class FakeMapping:
             source = "good-source.ts"
             original_line = 10
+            original_column = 0
             name = "mappedFunction"
 
         class GoodSourceMap:
             def lookup_left(self, line, column):
-                if (line, column) == (5, 12):
+                if (line, column) == (5, 11):
                     return FakeMapping()
 
         mock_ecma426_loads.return_value = GoodSourceMap()
@@ -771,7 +848,7 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.id}/")
         self.assertEqual(200, response.status_code)
         self.assertContains(response, "good-source.ts")
-        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11</span>")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11:1</span>")
 
     @patch("events.utils.ecma426.loads")
     def test_sourcemap_uploads_are_project_scoped_when_rendering_events(self, mock_ecma426_loads):
@@ -823,11 +900,12 @@ class ViewTests(TransactionTestCase):
         class FakeMapping:
             source = "other-project-source.ts"
             original_line = 0
+            original_column = 0
             name = "mappedFunction"
 
         class GoodSourceMap:
             def lookup_left(self, line, column):
-                if (line, column) == (5, 12):
+                if (line, column) == (5, 11):
                     return FakeMapping()
 
         mock_ecma426_loads.return_value = GoodSourceMap()
@@ -853,7 +931,7 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/issue/{other_issue.id}/event/{other_event.id}/")
         self.assertEqual(200, response.status_code)
         self.assertContains(response, "other-project-source.ts")
-        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">1</span>")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">1:1</span>")
 
         # Negative case: the same debug ID does not resolve across project boundaries.
         event = create_event(self.project, self.issue, event_data=event_data, project_digest_order=2)
